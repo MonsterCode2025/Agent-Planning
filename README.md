@@ -9,6 +9,8 @@
 - [安装与运行](#安装与运行)
 - [当 query 输入时，系统执行什么](#当-query-输入时系统执行什么)
 - [4 条确定性护栏详解](#4-条确定性护栏详解)
+- [Shannon plan_schema_v2 借鉴字段](#shannon-plan_schema_v2-借鉴字段)
+- [Token 用量与成本统计](#token-用量与成本统计)
 - [UI 四个 Tab 的含义](#ui-四个-tab-的含义)
 - [日志说明](#日志说明)
 - [配置项](#配置项)
@@ -20,17 +22,20 @@
 
 | 文章要点 | 代码位置 |
 |---|---|
-| `Subtask` 含 `Produces` / `Consumes` / `Boundaries` | [planner/types.py:11](planner/types.py:11) |
-| `DecompositionResult` 含 `complexity_score` / `execution_strategy` | [planner/types.py:22](planner/types.py:22) |
-| 任务分解（system prompt 强约束） | [planner/decompose.py](planner/decompose.py) |
+| `Subtask` 含 `Produces` / `Consumes` / `Boundaries` / `estimated_tokens` | [planner/types.py:16](planner/types.py:16) |
+| `DecompositionResult` 含 `complexity_score` / `execution_strategy` 等 | [planner/types.py:27](planner/types.py:27) |
+| **Shannon 借鉴**：`concurrency_limit` / `cognitive_strategy` / `confidence` / `fallback_strategy` / `agent_types` / `token_estimates` | [planner/types.py:33](planner/types.py:33) |
+| 任务分解 + `mode`（quick / standard / deep）粒度切换 | [planner/decompose.py:65](planner/decompose.py:65) `decompose_task` |
 | 拓扑排序（A → [B, C 并行] → D） | [planner/execute.py:9](planner/execute.py:9) `topological_layers` |
-| 范围边界注入 prompt（防止子任务内容重叠） | [planner/execute.py:41](planner/execute.py:41) `_SUBTASK_TEMPLATE` |
-| 覆盖度评估 + **护栏 1** 首轮低覆盖度强制继续 | [planner/evaluate.py:47](planner/evaluate.py:47) |
-| **护栏 2** 存在 critical 缺口 + 还有预算强制继续 | [planner/evaluate.py:53](planner/evaluate.py:53) |
-| **护栏 3** 达最大迭代强制停止 | [planner/evaluate.py:59](planner/evaluate.py:59) |
-| **护栏 4** 综合结果太短但报告高覆盖度则降级置信度 | [planner/evaluate.py:65](planner/evaluate.py:65) |
+| 范围边界注入 prompt（防止子任务内容重叠） | [planner/execute.py:34](planner/execute.py:34) `_SUBTASK_TEMPLATE` |
+| 并行执行 + `max_concurrency` 来自 `concurrency_limit` | [planner/execute.py:123](planner/execute.py:123) `execute_layer` |
+| 覆盖度评估 + **护栏 1** 首轮低覆盖度强制继续 | [planner/evaluate.py:54](planner/evaluate.py:54) |
+| **护栏 2** 存在 critical 缺口 + 还有预算强制继续 | [planner/evaluate.py:60](planner/evaluate.py:60) |
+| **护栏 3** 达最大迭代强制停止 | [planner/evaluate.py:66](planner/evaluate.py:66) |
+| **护栏 4** 综合结果太短但报告高覆盖度则降级置信度 | [planner/evaluate.py:72](planner/evaluate.py:72) |
 | 补充查询 + 多语言感知（`language_hint`） | [planner/subqueries.py](planner/subqueries.py) |
-| 完整 Research 循环（流式 yield 事件） | [planner/orchestrator.py:20](planner/orchestrator.py:20) `run_research` |
+| **Token / USD 用量追踪**：线程安全累加 + 按 stage 子账 | [planner/llm.py:32](planner/llm.py:32) `UsageTracker` |
+| 完整 Research 循环（流式 yield 事件，每事件附 `usage`） | [planner/orchestrator.py:40](planner/orchestrator.py:40) `run_research` |
 
 ---
 
@@ -39,20 +44,21 @@
 ```
 planning/
 ├── .env                          # LLM_BASE_URL / LLM_MODEL_ID / LLM_API_KEY / SERPAPI_API_KEY
+│                                 # + 可选：LLM_*_USD_PER_M 价格覆盖
 ├── requirements.txt
-├── app.py                        # Gradio UI + 状态条 + 完成通知
+├── app.py                        # Gradio UI（mode 选择 + 状态条 + token/cost chip + 完成通知）
 ├── logs/planner.log              # 运行后自动生成（滚动 5MB × 3）
 └── planner/
     ├── __init__.py               # load_dotenv()
-    ├── types.py                  # Pydantic 数据模型
-    ├── llm.py                    # DeepSeek (OpenAI 兼容) 客户端，json_object 模式
+    ├── types.py                  # Pydantic 数据模型 + UsageInfo / ChatResult (frozen dataclass)
+    ├── llm.py                    # DeepSeek (OpenAI 兼容) 客户端 + UsageTracker（按 stage 计费）
     ├── tools.py                  # web_search (SerpAPI) + web_fetch
-    ├── decompose.py              # 任务分解
-    ├── execute.py                # 拓扑排序 + 分层并行执行
+    ├── decompose.py              # 任务分解（quick / standard / deep 三档粒度）
+    ├── execute.py                # 拓扑排序 + 分层并行执行（max_concurrency 来自 concurrency_limit）
     ├── evaluate.py               # 覆盖度评估 + 4 条护栏
     ├── subqueries.py             # 补充查询生成（多语言感知）
     ├── synthesize.py             # 子任务结果综合
-    ├── orchestrator.py           # 完整 Research 循环（流式）
+    ├── orchestrator.py           # 完整 Research 循环（流式 yield，每事件附 usage）
     └── logger.py                 # 控制台 + 滚动文件双输出
 ```
 
@@ -138,6 +144,11 @@ LLM_API_KEY="sk-你的-deepseek-key"
 LLM_TIMEOUT=60
 
 SERPAPI_API_KEY="你的-serpapi-key"
+
+# 可选：LLM 价格覆盖（USD per 1M tokens；默认按 DeepSeek-chat 定价）
+# LLM_INPUT_USD_PER_M=0.27
+# LLM_CACHED_INPUT_USD_PER_M=0.07
+# LLM_OUTPUT_USD_PER_M=1.10
 ```
 
 - DeepSeek 密钥申请：<https://platform.deepseek.com/>
@@ -156,7 +167,9 @@ python app.py
 * Running on local URL:  http://127.0.0.1:7860
 ```
 
-浏览器打开 [http://127.0.0.1:7860](http://127.0.0.1:7860) 即可看到 UI。输入研究请求 → 点击「开始研究」→ 观察状态条 + 4 个 Tab 实时更新。
+浏览器打开 [http://127.0.0.1:7860](http://127.0.0.1:7860) 即可看到 UI。输入研究请求 → 选择 **分解粒度档位（mode）** / 最大迭代次数 / 主语言 → 点击「开始研究」→ 观察状态条（含累计 token / USD / calls）+ 4 个 Tab 实时更新。
+
+> **mode 三档**：`quick`（2-3 子任务，最省 token）/ `standard`（3-7 子任务，默认）/ `deep`（5-10 子任务，多维度细化）。该参数同时影响子任务个数与 system prompt 中的粒度提示。
 
 **控制台与 `logs/planner.log` 会同时输出完整执行日志**（见 [日志说明](#日志说明)）。
 
@@ -254,16 +267,17 @@ python app.py
 
 ### 阶段 1：任务分解
 
-**入口**：[planner/decompose.py:43](planner/decompose.py:43) `decompose_task(query, available_tools)`
+**入口**：[planner/decompose.py:65](planner/decompose.py:65) `decompose_task(query, available_tools, mode="standard")`
 
 **做了什么**：
 1. 把 query 和 `available_tools=["web_search", "web_fetch"]` 拼成 user message
-2. 调用 [planner/llm.py:24](planner/llm.py:24) `chat_json()`，传入 `response_format={"type": "json_object"}` 强制 JSON 输出
-3. LLM 的 system prompt（[planner/decompose.py:5](planner/decompose.py:5) `_DECOMPOSE_SYSTEM`）要求：
-   - 子任务数控制在 **3-7 个**（避免过度分解）
-   - 每个子任务必须声明 `produces` / `consumes` / `dependencies`
+2. 调用 [planner/llm.py:108](planner/llm.py:108) `chat_json()`，传入 `response_format={"type": "json_object"}` 强制 JSON 输出
+3. LLM 的 system prompt（[planner/decompose.py:11](planner/decompose.py:11) `_decompose_system(mode)`）要求：
+   - 子任务粒度按 `mode` 切换：`quick` 2-3 / `standard` 3-7 / `deep` 5-10
+   - 每个子任务必须声明 `produces` / `consumes` / `dependencies` / `estimated_tokens`
    - 用 `boundaries.in_scope` / `out_of_scope` 防止子任务内容重叠
    - 给出 `complexity_score` / `mode` / `execution_strategy`
+   - **Shannon 借鉴字段**：`concurrency_limit` / `cognitive_strategy` / `confidence` / `fallback_strategy` / `agent_types` / `token_estimates` / `total_estimated_tokens`
 4. 用 Pydantic `DecompositionResult.model_validate(data)` 解析
 
 **典型 LLM 输出**（示意）：
@@ -272,6 +286,13 @@ python app.py
   "mode": "standard",
   "complexity_score": 0.65,
   "execution_strategy": "dag",
+  "concurrency_limit": 3,
+  "cognitive_strategy": "plan_execute",
+  "confidence": 0.82,
+  "fallback_strategy": "react",
+  "agent_types": ["researcher", "analyst"],
+  "total_estimated_tokens": 12800,
+  "token_estimates": {"subtask-1": 2400, "subtask-2": 3200},
   "subtasks": [
     {
       "id": "subtask-1",
@@ -301,15 +322,15 @@ python app.py
 }
 ```
 
-**日志**：
+**日志**（含用量与 Shannon 字段）：
 ```
-[INFO] planner.orchestrator: [decompose] running
-[INFO] planner.orchestrator: [decompose] done | subtasks=5 | strategy=dag | complexity=0.65 | mode=standard
+[INFO] planner.orchestrator: [decompose] running mode=standard
+[INFO] planner.orchestrator: [decompose] done | subtasks=5 | strategy=dag | complexity=0.65 | concurrency_limit=3 | cognitive=plan_execute (conf=0.82, fb=react) | est_tokens=12800 | usage_tokens=1240 cost=$0.000845
 ```
 
 ### 阶段 2：拓扑分层执行
 
-**入口**：[planner/execute.py:9](planner/execute.py:9) `topological_layers(subtasks)` + [planner/execute.py:95](planner/execute.py:95) `execute_layer()`
+**入口**：[planner/execute.py:9](planner/execute.py:9) `topological_layers(subtasks)` + [planner/execute.py:123](planner/execute.py:123) `execute_layer()`
 
 **做了什么**：
 
@@ -329,15 +350,15 @@ python app.py
    ```
    循环依赖会抛 `ValueError("Cyclic dependency detected ...")`。
 
-2. **逐层执行**，每层用 `ThreadPoolExecutor(max_workers=min(4, len(layer)))` 并行：
+2. **逐层执行**，每层用 `ThreadPoolExecutor(max_workers=min(concurrency_limit, len(layer)))` 并行（`concurrency_limit` 由分解阶段给出，默认 4）：
    - 对每个 Subtask 调用 `execute_subtask(subtask, context, language)`
    - `context` 累积：上一层执行完后，`produces` 字段对应的内容写入 `context`，下一层通过 `consumes` 字段读取
 
 3. **每个子任务内部**：
    - 如果 `suggested_tools` 含 `web_search` → 调用 SerpAPI 搜 4 条结果
    - 如果含 `web_fetch` → 抓取前 2 条 URL 的正文（正则去标签，前 1500 字）
-   - 把 **范围边界**、**上游 context**、**搜索结果**、**抓取片段** 全部拼进 prompt（见 [planner/execute.py:41](planner/execute.py:41) `_SUBTASK_TEMPLATE`）
-   - 调用 LLM 生成本子任务的结构化输出
+   - 把 **范围边界**、**上游 context**、**搜索结果**、**抓取片段** 全部拼进 prompt（见 [planner/execute.py:34](planner/execute.py:34) `_SUBTASK_TEMPLATE`）
+   - 调用 LLM 生成本子任务的结构化输出（`stage="subtask"` 被记入用量子账）
    - 单个子任务失败不阻塞整体：捕获异常，返回带 `error` 字段的 `SubtaskResult`
 
 **日志**：
@@ -476,19 +497,70 @@ python app.py
 
 ---
 
+## Shannon plan_schema_v2 借鉴字段
+
+`DecompositionResult` 在原始字段（`mode` / `complexity_score` / `execution_strategy` / `subtasks`）之外，借鉴 Shannon plan_schema_v2 增加了一组"执行规划"元数据，使 orchestrator 能基于 LLM 的判断动态调度，而不是写死并发数与策略。
+
+实现位置：[planner/types.py:27](planner/types.py:27) `DecompositionResult` + [planner/decompose.py:11](planner/decompose.py:11) system prompt。
+
+| 字段 | 类型 | 默认 | 作用 |
+|---|---|---|---|
+| `concurrency_limit` | int | 4 | 当前 DAG 推荐的最大并发数；传给 `execute_layer(max_concurrency=...)` 控制 `ThreadPoolExecutor` |
+| `cognitive_strategy` | `plan_execute` / `react` / `cot` / `tot` / `auto` | `plan_execute` | 当前 query 的推荐推理模式（目前仅展示，尚未驱动分支） |
+| `confidence` | float | 0.0 | LLM 对策略选择的置信度，UI 直接展示 |
+| `fallback_strategy` | 同 `cognitive_strategy` 枚举 | `react` | 主策略失败时的回退候选 |
+| `agent_types` | list[str] | `[]` | 每个子任务建议的 agent 角色（如 `["researcher", "analyst"]`） |
+| `estimated_tokens`（Subtask） | int | 0 | LLM 预估的单个子任务总 token，UI 表格展示 |
+| `token_estimates` | dict[str, int] | `{}` | 子任务 id → 预估 token 的映射 |
+| `total_estimated_tokens` | int | 0 | 全部子任务 token 预估之和；用作 "**预估 token**" 在 UI 头部展示 |
+
+UI 在「① 任务分解」Tab 顶部一行渲染这些字段，子任务表格新增 **Est.tokens** 列。
+
+---
+
+## Token 用量与成本统计
+
+`planner/llm.py` 内置 `UsageTracker`，对每一次 LLM 调用记录 `prompt_tokens` / `completion_tokens` / `cached_tokens` / `cost_usd` / `calls`，并维护"总账 + stage 子账"两份：
+
+- **总账**：累计所有 stage 的用量
+- **stage 子账**：按调用方传入的 `stage` 字段分桶，目前的 stage 取值包括：`decompose` / `subtask` / `evaluate` / `subqueries` / `synthesize`
+
+| 关键点 | 代码位置 |
+|---|---|
+| 线程安全累加器（带 lock） | [planner/llm.py:32](planner/llm.py:32) `UsageTracker` |
+| `prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens` 兼容 | [planner/llm.py:63](planner/llm.py:63) `_extract_usage` |
+| 价格计算（fresh vs cached input 分别计费） | [planner/llm.py:23](planner/llm.py:23) `_calc_cost` |
+| 每个 yield 事件附带 `usage` 快照 | [planner/orchestrator.py:20](planner/orchestrator.py:20) `_usage_snapshot` |
+| `run_research` 起点先 `tracker.reset()` | [planner/orchestrator.py:51](planner/orchestrator.py:51) |
+
+**价格默认值**（DeepSeek-chat 标准价，可用 env 覆盖）：
+
+| 环境变量 | 默认 (USD per 1M tokens) |
+|---|---|
+| `LLM_INPUT_USD_PER_M` | `0.27` |
+| `LLM_CACHED_INPUT_USD_PER_M` | `0.07` |
+| `LLM_OUTPUT_USD_PER_M` | `1.10` |
+
+**UI 呈现**：
+- 状态条右侧实时显示 `X tokens · $Y · N calls`，完成态额外显示 `cache K`
+- 「③ 最终报告」末尾追加一张 **LLM 用量分布（by stage）** 表格，列出各 stage 的 tokens / cost / calls
+- 完成通知带成本：`研究已完成（X 轮迭代，覆盖度 Y%，花费 $Z）`
+
+---
+
 ## UI 四个 Tab 的含义
 
 | Tab | 内容 | 数据来源 |
 |---|---|---|
-| ① 任务分解 | 子任务表格（ID / 描述 / Produces / Consumes / 依赖 / InScope / OutOfScope） | `decompose` 阶段的 `decomposition` 字段 |
+| ① 任务分解 | 顶部摘要（复杂度 / mode / 策略 / **并发上限** / **预估 token** / **认知策略** / **agent 类型**）+ 子任务表格（ID / 描述 / Produces / Consumes / 依赖 / **Est.tokens** / InScope / OutOfScope） | `decompose` 阶段的 `decomposition` 字段 |
 | ② 覆盖度迭代 | 每轮迭代的覆盖度、缺口、置信度、**触发了哪条护栏** | `evaluate` 阶段的 `coverage` 字段 |
-| ③ 最终报告 | LLM 综合后的 markdown 报告 | `synthesize` / `final` 阶段的 `synthesis` 字段 |
+| ③ 最终报告 | LLM 综合后的 markdown 报告 + **LLM 用量分布表（by stage）** | `synthesize` / `final` 阶段的 `synthesis` + `usage` |
 | ④ 事件日志 | 带时间戳的 UI 内审计日志（最近 80 行） | 每个 yield 事件的紧凑摘要 |
 
-顶部还有一个**状态条**（`gr.HTML`）：
+顶部还有一个**状态条**（`gr.HTML`），右侧带 `tokens · $cost · calls` 实时标签：
 - 灰 = 空闲
-- 黄 = 运行中（实时阶段名 + 耗时）
-- 绿 = 已完成（迭代次数 / 覆盖度 / 耗时 / 终止原因）
+- 黄 = 运行中（实时阶段名 + 耗时 + 累计用量）
+- 绿 = 已完成（迭代次数 / 覆盖度 / 耗时 / 终止原因 / 用量 + cache 命中）
 - 红 = 失败（错误信息）
 
 ---
@@ -530,6 +602,9 @@ python app.py
 | `LLM_API_KEY` | LLM 密钥 |
 | `LLM_TIMEOUT` | LLM 请求超时秒数（默认 60） |
 | `SERPAPI_API_KEY` | SerpAPI 密钥（用于 `web_search`） |
+| `LLM_INPUT_USD_PER_M` | 输入 token 单价（USD/1M），默认 `0.27` |
+| `LLM_CACHED_INPUT_USD_PER_M` | 缓存命中输入 token 单价，默认 `0.07` |
+| `LLM_OUTPUT_USD_PER_M` | 输出 token 单价，默认 `1.10` |
 
 环境变量：
 
@@ -542,10 +617,10 @@ python app.py
 
 | 常量 | 位置 | 默认 | 说明 |
 |---|---|---|---|
-| `MAX_ITERATIONS_DEFAULT` | [planner/orchestrator.py:11](planner/orchestrator.py:11) | 3 | 默认最大迭代数 |
-| `_COVERAGE_THRESHOLD` | [planner/evaluate.py:27](planner/evaluate.py:27) | 0.85 | 质量达标阈值 |
-| `_LOW_CONFIDENCE_LEN` | [planner/evaluate.py:28](planner/evaluate.py:28) | 500 | 护栏 4 字数阈值 |
-| `max_workers` | [planner/execute.py:103](planner/execute.py:103) | `min(4, len(layer))` | 并行执行并发上限 |
+| `MAX_ITERATIONS_DEFAULT` | [planner/orchestrator.py:14](planner/orchestrator.py:14) | 3 | 默认最大迭代数（UI 滑杆默认 2） |
+| `_COVERAGE_THRESHOLD` | [planner/evaluate.py:26](planner/evaluate.py:26) | 0.85 | 质量达标阈值 |
+| `_LOW_CONFIDENCE_LEN` | [planner/evaluate.py:27](planner/evaluate.py:27) | 500 | 护栏 4 字数阈值 |
+| `max_workers` | [planner/execute.py:137](planner/execute.py:137) | `min(concurrency_limit, len(layer))` | 并行执行并发上限（`concurrency_limit` 来自分解结果） |
 
 ---
 
@@ -555,5 +630,7 @@ python app.py
 2. **没有缓存**：同一 query 重跑会重新付费调用 LLM/SerpAPI。生产场景建议加结果级缓存（按 `query + subtask_id` 做 key）。
 3. **没有持久化**：每次重启 UI，研究记录丢失。
 4. **重试机制简单**：单个子任务失败仅记录 `error`，不会自动重试。
-5. **Token 预算护栏未实现**：文章里提到"预算耗尽即停"，本实现只用迭代次数控制，没有按 token 计费。
+5. **Token 预算护栏未实现**：虽然已可实时统计 token / USD（见 [Token 用量与成本统计](#token-用量与成本统计)），但终止仍由 `max_iterations` 与覆盖度护栏控制，没有按预算硬性截断。`total_estimated_tokens` 仅用于展示。
+6. **`cognitive_strategy` / `fallback_strategy` 仅展示**：LLM 输出的推荐推理模式与回退策略目前只在 UI 显示，尚未在 orchestrator 中分支驱动不同执行路径。
+7. **价格默认按 DeepSeek-chat**：换用其他模型时需手动通过 `LLM_*_USD_PER_M` env 覆盖，否则成本数值不准确。
 
