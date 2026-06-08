@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 from .llm import chat
 from .tools import web_fetch, web_search
@@ -6,10 +7,7 @@ from .types import Subtask, SubtaskResult
 
 
 def topological_layers(subtasks: list[Subtask]) -> list[list[Subtask]]:
-    """Group subtasks into layers, each layer runnable in parallel.
-
-    Raises ValueError on cycles or dangling dependencies.
-    """
+    """Group subtasks into layers, each layer runnable in parallel."""
     id_to_sub = {s.id: s for s in subtasks}
     in_degree = {s.id: 0 for s in subtasks}
     for s in subtasks:
@@ -62,7 +60,11 @@ _SUBTASK_TEMPLATE = """你是一名严谨的研究员，正在执行一个子任
 """
 
 
-def execute_subtask(subtask: Subtask, context: dict[str, str], language: str = "en") -> SubtaskResult:
+def execute_subtask(
+    subtask: Subtask,
+    context: dict[str, str],
+    language: str = "en",
+) -> SubtaskResult:
     try:
         consumed = "\n".join(
             f"- {k}: {v[:600]}" for k, v in context.items() if k in subtask.consumes
@@ -99,8 +101,16 @@ def execute_subtask(subtask: Subtask, context: dict[str, str], language: str = "
             sources=sources,
             fetched=fetched,
         )
-        content = chat([{"role": "user", "content": prompt}], temperature=0.3)
-        return SubtaskResult(subtask_id=subtask.id, description=subtask.description, content=content)
+        result = chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0.3,
+            stage="subtask",
+        )
+        return SubtaskResult(
+            subtask_id=subtask.id,
+            description=subtask.description,
+            content=result.content,
+        )
     except Exception as e:
         return SubtaskResult(
             subtask_id=subtask.id,
@@ -110,8 +120,20 @@ def execute_subtask(subtask: Subtask, context: dict[str, str], language: str = "
         )
 
 
-def execute_layer(layer: list[Subtask], context: dict[str, str], language: str = "en") -> list[SubtaskResult]:
+def execute_layer(
+    layer: list[Subtask],
+    context: dict[str, str],
+    language: str = "en",
+    max_concurrency: Optional[int] = None,
+) -> list[SubtaskResult]:
+    """并发执行同一层的子任务。
+
+    max_concurrency 来自分解阶段的 `concurrency_limit`（Shannon 借鉴），
+    实际 worker 数取 min(max_concurrency, len(layer)) 并保底 1。
+    """
     if len(layer) == 1:
         return [execute_subtask(layer[0], context, language)]
-    with ThreadPoolExecutor(max_workers=min(4, len(layer))) as pool:
+    cap = max_concurrency if (max_concurrency and max_concurrency > 0) else 4
+    workers = max(1, min(cap, len(layer)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(lambda s: execute_subtask(s, context, language), layer))

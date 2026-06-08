@@ -7,14 +7,24 @@ from planner.orchestrator import run_research
 
 
 def _fmt_decomposition(d: dict) -> str:
-    header = (
-        f"**复杂度**: {d['complexity_score']:.2f} "
-        f"| **模式**: `{d['mode']}` "
-        f"| **执行策略**: `{d['execution_strategy']}`\n\n"
-    )
+    """渲染分解结果：顶部摘要 + 子任务表。"""
+    head_lines = [
+        f"**复杂度**: {d['complexity_score']:.2f}",
+        f"**模式**: `{d['mode']}`",
+        f"**执行策略**: `{d['execution_strategy']}`",
+        f"**并发上限**: `{d.get('concurrency_limit', '—')}`",
+        f"**预估总 token**: `{d.get('total_estimated_tokens', 0):,}`",
+        f"**认知策略**: `{d.get('cognitive_strategy', '—')}`"
+        f" (置信度 `{d.get('confidence', 0):.2f}`，回退 `{d.get('fallback_strategy', '—')}`)",
+    ]
+    agent_types = d.get("agent_types") or []
+    if agent_types:
+        head_lines.append(f"**Agent 类型**: {', '.join(f'`{a}`' for a in agent_types)}")
+    header = " | ".join(head_lines) + "\n\n"
+
     rows = [
-        "| ID | 描述 | Produces | Consumes | Depends on | InScope | OutOfScope |",
-        "|---|---|---|---|---|---|---|",
+        "| ID | 描述 | Produces | Consumes | Depends on | Est.tokens | InScope | OutOfScope |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for st in d["subtasks"]:
         b = st.get("boundaries") or {}
@@ -24,6 +34,7 @@ def _fmt_decomposition(d: dict) -> str:
             f"| {', '.join(st.get('produces', [])) or '—'} "
             f"| {', '.join(st.get('consumes', [])) or '—'} "
             f"| {', '.join(st.get('dependencies', [])) or '—'} "
+            f"| {st.get('estimated_tokens', 0):,} "
             f"| {', '.join(b.get('in_scope', [])) or '—'} "
             f"| {', '.join(b.get('out_of_scope', [])) or '—'} |"
         )
@@ -55,16 +66,38 @@ def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
-def _status_running(stage_label: str, elapsed: float) -> str:
+def _usage_chip(usage: dict) -> str:
+    """状态条右侧的小标签：累计 token / cost / calls。"""
+    if not usage:
+        return ""
+    return (
+        f" · <code>{usage.get('total_tokens', 0):,}</code> tokens"
+        f" · <code>${usage.get('total_cost_usd', 0):.6f}</code>"
+        f" · <code>{usage.get('total_calls', 0)}</code> calls"
+    )
+
+
+def _status_running(stage_label: str, elapsed: float, usage: dict | None = None) -> str:
+    chip = _usage_chip(usage or {})
     return (
         f"<div style='padding:10px 14px;border-radius:8px;"
         f"background:#fffbe6;border-left:4px solid #faad14;'>"
         f"<b>状态：运行中</b> · {stage_label} · 已耗时 <code>{elapsed:.1f}s</code>"
+        f"{chip}"
         f"</div>"
     )
 
 
-def _status_done(iterations: int, coverage: float, elapsed: float, reason: str) -> str:
+def _status_done(
+    iterations: int,
+    coverage: float,
+    elapsed: float,
+    reason: str,
+    usage: dict | None = None,
+) -> str:
+    chip = _usage_chip(usage or {})
+    cached = (usage or {}).get("total_cached_tokens", 0)
+    cached_chip = f" · cache <code>{cached:,}</code>" if cached else ""
     return (
         f"<div style='padding:10px 14px;border-radius:8px;"
         f"background:#f6ffed;border-left:4px solid #52c41a;'>"
@@ -73,6 +106,7 @@ def _status_done(iterations: int, coverage: float, elapsed: float, reason: str) 
         f"最终覆盖度 <code>{coverage:.0f}%</code> · "
         f"耗时 <code>{elapsed:.1f}s</code> · "
         f"终止原因 <code>{reason}</code>"
+        f"{chip}{cached_chip}"
         f"</div>"
     )
 
@@ -95,6 +129,24 @@ def _status_idle() -> str:
     )
 
 
+def _fmt_usage_breakdown(usage: dict) -> str:
+    """final 时把 by_stage 渲染为表格。"""
+    by_stage = usage.get("by_stage") or {}
+    if not by_stage:
+        return ""
+    rows = ["", "### LLM 用量分布（by stage）", "| Stage | Tokens | Cost (USD) | Calls |", "|---|---|---|---|"]
+    for stage, v in sorted(by_stage.items(), key=lambda x: -x[1]["tokens"]):
+        rows.append(
+            f"| `{stage}` | {v['tokens']:,} | ${v['cost_usd']:.6f} | {v['calls']} |"
+        )
+    rows.append(
+        f"| **TOTAL** | **{usage.get('total_tokens', 0):,}** "
+        f"| **${usage.get('total_cost_usd', 0):.6f}** "
+        f"| **{usage.get('total_calls', 0)}** |"
+    )
+    return "\n".join(rows)
+
+
 _STAGE_LABEL = {
     ("decompose", "running"): "正在分解任务",
     ("decompose", "done"): "任务分解完成",
@@ -112,7 +164,7 @@ _STAGE_LABEL = {
 }
 
 
-def research(query: str, max_iter: int, language: str):
+def research(query: str, max_iter: int, language: str, mode: str):
     if not query.strip():
         gr.Warning("请先输入研究请求")
         yield (
@@ -138,27 +190,43 @@ def research(query: str, max_iter: int, language: str):
         return "\n\n".join(log_lines[-80:])
 
     status = _status_running("启动中", 0.0)
-    log = push_log("start", f"query={query!r}, max_iter={max_iter}, lang={language}")
+    log = push_log(
+        "start",
+        f"query={query!r}, mode={mode}, max_iter={max_iter}, lang={language}",
+    )
     yield status, decomp_md, iter_md, final_md, log
 
     try:
-        for event in run_research(query, max_iterations=int(max_iter), language=language):
+        for event in run_research(
+            query,
+            max_iterations=int(max_iter),
+            language=language,
+            mode=mode,
+        ):
             stage = event.get("stage", "")
             ev_status = event.get("status", "")
+            usage = event.get("usage", {})
 
             label = _STAGE_LABEL.get((stage, ev_status), f"{stage}/{ev_status}")
-            status = _status_running(label, elapsed())
+            status = _status_running(label, elapsed(), usage)
 
             if stage == "decompose" and ev_status == "done":
                 decomp_md = _fmt_decomposition(event["decomposition"])
+                d = event["decomposition"]
                 log = push_log(
                     "decompose",
-                    f"→ {len(event['decomposition']['subtasks'])} 个子任务",
+                    f"→ {len(d['subtasks'])} 个子任务 "
+                    f"(strategy={d['execution_strategy']}, "
+                    f"concurrency={d.get('concurrency_limit')}, "
+                    f"cognitive={d.get('cognitive_strategy')}@{d.get('confidence',0):.2f})",
                 )
 
             elif stage == "execute" and ev_status == "plan":
                 layers = event["layers"]
-                log = push_log("topo", f"→ {len(layers)} 层: {layers}")
+                log = push_log(
+                    "topo",
+                    f"→ {len(layers)} 层: {layers} (并发上限 {event.get('concurrency_limit')})",
+                )
 
             elif stage == "execute" and ev_status == "layer_running":
                 log = push_log(
@@ -215,22 +283,26 @@ def research(query: str, max_iter: int, language: str):
                 log = push_log("complete", f"reason={event['reason']}")
 
             elif stage == "final":
-                final_md = event["synthesis"]
+                final_md = event["synthesis"] + "\n\n" + _fmt_usage_breakdown(usage)
                 status = _status_done(
                     iterations=event.get("iterations", 0),
                     coverage=event.get("final_coverage", 0.0),
                     elapsed=event.get("elapsed_seconds", elapsed()),
                     reason=event.get("reason", ""),
+                    usage=usage,
                 )
                 log = push_log(
                     "final",
-                    f"完成 | 迭代 {event.get('iterations',0)} 次 | "
-                    f"覆盖度 {event.get('final_coverage',0):.0f}% | "
-                    f"耗时 {event.get('elapsed_seconds', elapsed()):.1f}s",
+                    f"完成 | 迭代 {event.get('iterations',0)} 次 "
+                    f"| 覆盖度 {event.get('final_coverage',0):.0f}% "
+                    f"| 耗时 {event.get('elapsed_seconds', elapsed()):.1f}s "
+                    f"| tokens {usage.get('total_tokens',0):,} "
+                    f"| cost ${usage.get('total_cost_usd',0):.6f}",
                 )
                 gr.Info(
                     f"研究已完成（{event.get('iterations',0)} 轮迭代，"
-                    f"覆盖度 {event.get('final_coverage',0):.0f}%）"
+                    f"覆盖度 {event.get('final_coverage',0):.0f}%，"
+                    f"花费 ${usage.get('total_cost_usd',0):.6f}）"
                 )
 
             else:
@@ -247,6 +319,8 @@ def research(query: str, max_iter: int, language: str):
 _DESC = """### 演示《AI Agent 架构》第 10 章 Planning 模式
 
 **Pipeline**: 任务分解 → 拓扑排序 DAG 执行（边界声明防重叠）→ 综合 → 覆盖度评估（**4 条确定性护栏**）→ 补充查询（多语言感知）→ 迭代
+
+**Shannon 借鉴增强**：分解结果含 `concurrency_limit` / `token_estimates` / `cognitive_strategy` / `confidence` / `fallback_strategy` / `agent_types`；运行过程实时统计 **token 用量与 USD 成本**。
 
 **护栏**:
 1. 首轮 + 低覆盖度 → 强制继续
@@ -272,6 +346,12 @@ with gr.Blocks(title="Planning Agent — 第 10 章演示") as demo:
                 lines=3,
             )
         with gr.Column(scale=1):
+            mode = gr.Dropdown(
+                choices=["quick", "standard", "deep"],
+                value="standard",
+                label="分解粒度档位（mode）",
+                info="quick=2-3 子任务 / standard=3-7 / deep=5-10",
+            )
             max_iter = gr.Slider(1, 5, value=2, step=1, label="最大迭代次数")
             language = gr.Dropdown(
                 choices=["en", "zh", "ja", "ko"],
@@ -292,7 +372,7 @@ with gr.Blocks(title="Planning Agent — 第 10 章演示") as demo:
 
     run_btn.click(
         research,
-        inputs=[query_box, max_iter, language],
+        inputs=[query_box, max_iter, language, mode],
         outputs=[status_view, decomp_view, iter_view, final_view, log_view],
     )
 

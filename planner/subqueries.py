@@ -1,5 +1,5 @@
 from .llm import chat_json
-from .types import CoverageGap, GeneratedSubquery
+from .types import CoverageGap, GeneratedSubquery, UsageInfo
 
 _SUBQUERY_SYSTEM = """你是研究查询生成器。任务是生成针对性的子查询来填补覆盖缺口。
 
@@ -32,9 +32,9 @@ def generate_subqueries(
     query: str,
     critical_gaps: list[CoverageGap],
     max_n: int = 3,
-) -> list[GeneratedSubquery]:
+) -> tuple[list[GeneratedSubquery], UsageInfo]:
     if not critical_gaps:
-        return []
+        return [], UsageInfo()
     gaps_text = "\n".join(
         f"- [{g.severity}] {g.area}: {g.description}" for g in critical_gaps
     )
@@ -43,11 +43,12 @@ def generate_subqueries(
         f"待填补的缺口：\n{gaps_text}\n\n"
         f"最多生成 {max_n} 个子查询。"
     )
-    data = chat_json(
+    data, usage = chat_json(
         [
             {"role": "system", "content": _SUBQUERY_SYSTEM},
             {"role": "user", "content": user},
-        ]
+        ],
+        stage="subqueries",
     )
     raw = data.get("subqueries", [])
-    return [GeneratedSubquery.model_validate(sq) for sq in raw[:max_n]]
+    return [GeneratedSubquery.model_validate(sq) for sq in raw[:max_n]], usage

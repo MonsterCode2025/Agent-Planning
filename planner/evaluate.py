@@ -1,5 +1,5 @@
 from .llm import chat_json
-from .types import CoverageEvaluationResult
+from .types import CoverageEvaluationResult, UsageInfo
 
 _EVAL_SYSTEM = """你是研究质量评估专家。请评估当前综合结果对原始请求的覆盖度。
 
@@ -32,19 +32,20 @@ def evaluate_coverage(
     synthesis: str,
     iteration: int,
     max_iterations: int,
-) -> CoverageEvaluationResult:
-    """LLM 评估 + 确定性护栏（参见文章 10.5）。"""
+) -> tuple[CoverageEvaluationResult, UsageInfo]:
+    """LLM 评估 + 确定性护栏（参见文章 10.5）。返回 (结果, 本次 LLM 调用用量)。"""
     user = (
         f"原始请求：{query}\n\n"
         f"当前迭代：{iteration}/{max_iterations}\n\n"
         f"当前综合结果（共 {len(synthesis)} 字）：\n{synthesis}\n\n"
         f"请输出评估 JSON。"
     )
-    data = chat_json(
+    data, usage = chat_json(
         [
             {"role": "system", "content": _EVAL_SYSTEM},
             {"role": "user", "content": user},
-        ]
+        ],
+        stage="evaluate",
     )
     result = CoverageEvaluationResult.model_validate(data)
     triggered: list[str] = []
@@ -83,4 +84,4 @@ def evaluate_coverage(
         triggered.append("quality_threshold_met")
 
     result.guardrail_triggered = triggered
-    return result
+    return result, usage
